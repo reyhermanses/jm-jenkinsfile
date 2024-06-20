@@ -1,0 +1,187 @@
+/*
+ * parameter should exists : 
+ * - branch     = string default(master) 
+ * - tag        = string default(latest)
+ * - buildType  = dropdown [rebuild-and-push-to-artifactory | build-only | pull-only | deploy-only-to-ocp]
+ * - restartPod = boolean
+ *
+ */
+
+// project source code
+def projectRepo = "ssh://git@10.1.3.180:7999/agp/aggregator-mapping-v3.git"
+def branch = env.branch
+
+// artifactory
+def url = 'http://10.1.3.177:8082/artifactory/'
+def repo = "aggregator-postgres-v3"
+def jfrogurl = "jfrogartifactory.jasamarga.co.id"
+def tagName = env.tag
+
+// sonarqube
+def sonarUrl = "http://10.1.3.189:9000"
+
+// ocp 
+def ocpurl = "https://api.ocdev.jasamarga.co.id:6443/"
+def ocpproject = "aggregator-postgres-v3"
+def appName = "aggregator-postgres-v3"
+def configMapName = "aggregator-postgres-v3-configmap"
+def isNotNewApp = false
+def appUrl = '' // updated after deployed to ocp
+def webhookKey = 'aggregator-postgres-v3'
+
+// deployment file
+def repoDeploymentFile = "https://gitlab.jasamarga.co.id:8081/tri.adhi/template-deployment-ocp-yaml.git"
+def deploymentPath = "agregator-data"
+
+// jenkins param
+def buildType = env.buildType
+def restartPod = env.restartPod
+
+def imageName = "${jfrogurl}/${repo}/${appName}:${tagName}"
+def exposePORT = "8080"
+def ocpenv = "ocdev"
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    environment {
+        GIT_CREDENTIALS = credentials('gitlab-root')
+        DISCORD_URL = credentials('discord-webhook')
+        LAST_COMMIT_AUTHOR = ''
+        LAST_COMMIT_MESSAGE = ''
+    }
+    stages {
+        stage('Clone') {
+            steps {
+                script{
+                    cleanWs()
+                    discordSend description: "Job Started", footer: "Aggregator Development", link: env.BUILD_URL, result: currentBuild.currentResult, title: "Aggregator Build ID ${env.BUILD_ID}", webhookURL: DISCORD_URL
+
+                    sh """
+                    id
+                    """
+
+                    checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'bitbucket-riandycandra-ssh', url: "${projectRepo}"]], branches: [[name: "${branch}"]]]
+                }
+            }
+        }
+        
+        stage('create image and push artifactory') {
+            steps {
+                script{
+
+                    sh"""
+                        git config --global credential.username $GIT_CREDENTIALS_USR
+                        git config --global credential.helper "!echo password=$GIT_CREDENTIALS_PSW; echo"
+
+                        git clone ${repoDeploymentFile}
+
+                        cp ${WORKSPACE}/template-deployment-ocp-yaml/${deploymentPath}/* ${WORKSPACE}
+                        rm -rf ${WORKSPACE}/template-deployment-ocp-yaml
+                    """
+
+                    // Fetch the latest commit information
+                    def commitInfo = sh(script: 'git log -1 --pretty=format:"%H %an %s"', returnStdout: true).trim()
+
+                    // Split the commit information into parts
+                    def commitParts = commitInfo.split(' ')
+                    def lastCommitHash = commitParts[0]
+                    def lastCommitAuthor = commitParts[1]
+                    def lastCommitMessage = commitParts[2..-1].join(' ')
+
+                    LAST_COMMIT_AUTHOR = lastCommitAuthor
+                    LAST_COMMIT_MESSAGE = lastCommitMessage
+
+                    if(env.buildType == 'rebuild-and-push-to-artifactory' || env.buildType == 'build-only') {
+						withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'devops-artifactory',usernameVariable: 'artifactoryUsername', passwordVariable: 'artifactoryPassword']]) { 
+							sh"""
+								sudo podman login -u ${artifactoryUsername} -p ${artifactoryPassword} ${jfrogurl}
+								sudo podman build -t  ${jfrogurl}/${repo}/${appName}:${tagName} -f "${WORKSPACE}/Dockerfile"
+								sudo podman push ${jfrogurl}/${repo}/${appName}:${tagName}
+							"""
+						}
+					}
+
+                    if(env.buildType == 'pull-only') {
+                        sh """
+							curl ${appUrl}/gitlab-webhook?key=${webhookKey}
+						"""
+                    }
+                }
+            }
+        }
+        
+        stage('Deployment To OCP') {
+            steps {
+                script{
+                    if(env.buildType == 'rebuild-and-push-to-artifactory' || env.buildType == 'deploy-only-to-ocp') {
+						withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'ocp-dev',usernameVariable: 'ocpUsername', passwordVariable: 'ocpPassword']]) { 
+							try{
+								sh"""
+									oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+									oc project ${ocpproject}
+									oc delete istag ${appName}:${tagName}
+								"""
+							}catch(Exception e){
+								echo "new tag"
+							}
+							sh """
+								oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+								oc project ${ocpproject}
+								oc adm policy add-scc-to-user anyuid -z default
+								sed -i 's,{APP_NAME},${appName},g' deployment.yaml
+                                sed -i 's,{IMAGE},${imageName},g' deployment.yaml
+                                sed -i 's,{NAMESPACE},${ocpproject},g' deployment.yaml
+                                sed -i 's,{PORT},${exposePORT},g' deployment.yaml
+                                sed -i 's,{APP_NAME},${appName},g' service.yaml
+                                sed -i 's,{NAMESPACE},${ocpproject},g' service.yaml
+                                sed -i 's,{PORT},${exposePORT},g' service.yaml
+                                sed -i 's,{APP_NAME},${appName},g' routes.yaml
+                                sed -i 's,{OCPENV},${ocpenv},g' routes.yaml
+                                sed -i 's,{NAMESPACE},${ocpproject},g' routes.yaml
+                                sed -i 's,{PORT},${exposePORT},g' routes.yaml
+								oc apply -n '${ocpproject}' -f deployment.yaml
+                                oc apply -n '${ocpproject}' -f service.yaml
+                                oc apply -n '${ocpproject}' -f routes.yaml
+                                oc set env deploy/${appName} --from=configmap/${configMapName}
+                                oc annotate route ${appName} --overwrite haproxy.router.openshift.io/timeout=5000s
+                                oc set resources deploy/${appName} --limits=cpu=1,memory=1Gi --requests=cpu=100m,memory=500Mi
+								oc rollout status deployment/'${appName}' -n '${ocpproject}'
+								oc logout
+								sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+							"""
+						}
+					}
+
+					if(env.restartPod == 'true') {
+                        withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'ocp-dev',usernameVariable: 'ocpUsername', passwordVariable: 'ocpPassword']]) { 
+                            try {
+                                sh """
+                                    oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+									oc project ${ocpproject}
+                                    oc rollout restart deployment/'${appName}' 
+                                """
+                            } catch(Exception e) {
+                                echo ${e}
+                            }
+                        }
+					}
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                discordSend description: "Job Run Successfully by ${LAST_COMMIT_AUTHOR} - ${LAST_COMMIT_MESSAGE}", footer: "Aggregator Development", link: env.BUILD_URL, result: currentBuild.currentResult, title: "Aggregator Build ID ${env.BUILD_ID}", webhookURL: DISCORD_URL
+            }
+        }
+        failure {
+            script {
+                discordSend description: "Job Failed by ${LAST_COMMIT_AUTHOR} - ${LAST_COMMIT_MESSAGE}", footer: "Aggregator Development", link: env.BUILD_URL, result: currentBuild.currentResult, title: "Aggregator Build ID ${env.BUILD_ID}", webhookURL: DISCORD_URL
+            }
+        }
+    }
+}

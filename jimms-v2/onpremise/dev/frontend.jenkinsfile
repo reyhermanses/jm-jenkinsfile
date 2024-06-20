@@ -1,0 +1,78 @@
+/*
+ * parameter should exists : 
+ * - branch     = string default(master) 
+ * - tag        = string default(latest)
+ * - buildType  = choice [rebuild-and-push-to-artifactory | build-only | pull-only | deploy-only-to-ocp]
+ * - restartPod = boolean
+ *
+ */
+
+
+// project source code
+def projectRepo = "git@gitlab.jasamarga.co.id:dwisatriow/jimms-frontend.git"
+def branch = env.branch
+
+// artifactory
+def url = 'http://10.1.3.177:8082/artifactory/'
+def repo = "jimms-v2"
+def jfrogurl = "jfrogartifactory.jasamarga.co.id"
+def tagName = env.tag
+def appName = "jimms-fe"
+
+def ip = "10.1.12.239"
+def envPath = "/var/www/html/jimms-v2-fe/env"
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    environment {
+        GIT_CREDENTIALS = credentials('gitlab-root')
+    }
+    stages {
+        stage('Clone') {
+            steps {
+                script{
+                    cleanWs()
+                    checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'gitlab-ssh-root', url: "${projectRepo}"]], branches: [[name: "${branch}"]]]                  
+                    echo "success step 1"
+                }
+            }
+        }
+
+        stage('create image and push artifactory') {
+            steps {
+                script{
+
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'devops-artifactory',usernameVariable: 'artifactoryUsername', passwordVariable: 'artifactoryPassword']]) { 
+						sh"""
+							sudo podman login -u ${artifactoryUsername} -p ${artifactoryPassword} ${jfrogurl}
+							sudo podman build -t  ${jfrogurl}/${repo}/${appName}:${tagName} -f "${WORKSPACE}/Dockerfile"
+							sudo podman push ${jfrogurl}/${repo}/${appName}:${tagName}
+						"""
+					}
+
+                    echo "success step 4"
+                }
+            }
+        }
+        
+        stage('Deployment') {
+            steps {
+                script{
+                    sshagent(credentials: ['ssh-10.1.12.239']) {
+                        // Inside the SSH agent, run SSH command to change directory
+                        sh """
+                            ssh root@${ip} "
+                            docker pull ${jfrogurl}/${repo}/${appName}:${tagName}; 
+                            docker kill jimms-fe-public 2>&1 >/dev/null;
+                            docker rm jimms-fe-public 2>&1 >/dev/null;
+                            docker run --env-file=${envPath} -d -p 9001:3000 --name=jimms-fe-public ${jfrogurl}/${repo}/${appName}:${tagName}"
+                        """
+                    }
+                    echo "success step 5"
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,131 @@
+def gitRepo = "http://10.1.3.180:7990/scm/tes/express.git"
+//artifactory
+def url = 'http://10.1.3.177:8082/artifactory/'
+def repo = "agregator-data"
+def jfrogurl = "jfrogartifactory.jasamarga.co.id"
+
+def appName = "jmauth"
+def tagName = env.tag
+
+def ocpurl = "https://api.ocdev.jasamarga.co.id:6443/"
+def ocpproject = "agregator-data-uat"
+def configMapName = "jmauth-config-uat"
+
+def isNotNewApp = false
+
+def zapDir = "/opt/zap"
+def zapPort = "8085"
+def zapScanUrl = "http://jmauth-agregator-data-uat.apps.ocdev.jasamarga.co.id/"
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    
+    stages {
+        stage('preparation') {
+            steps {
+                script{
+                    cleanWs()
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'devops-artifactory',usernameVariable: 'artifactoryUsername', passwordVariable: 'artifactoryPassword']]) {
+                            sh"""
+                                sudo podman login -u ${artifactoryUsername} -p ${artifactoryPassword} ${jfrogurl}
+                                sudo podman pull ${jfrogurl}/${repo}/${appName}:${tagName}
+                            """
+                    } 
+                    echo "success step 1"
+                }
+            }
+        }
+        
+        stage('Deployment To OCP') {
+            steps {
+                script{
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'ocp-dev',usernameVariable: 'ocpUsername', passwordVariable: 'ocpPassword']]) { 
+                        sh"""
+                            oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                            oc project ${ocpproject}
+                        """
+                        String pod = sh(script:"oc get pod", returnStdout: true).toString().trim()
+                        echo "value pod "+pod
+                        if(pod.contains("${appName}")){
+                            isNotNewApp = true
+                        }else{
+                            isNotNewApp = false
+                        }
+                        if(isNotNewApp){
+                            sh"""
+                                oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                oc project ${ocpproject}
+                                oc delete deploy ${appName}
+                                oc delete service ${appName}
+                                oc delete route ${appName}
+                            """
+                            try{
+                                sh"""
+                                    oc delete istag ${appName}:${tagName}
+                                """
+                            }catch(Exception e){
+                                echo "new tag"
+                            }
+                            sleep 120
+                            sh"""
+                                oc new-app --docker-image=${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc expose service/${appName} --port=3001-tcp
+                                oc set env deploy/${appName} --from=configmap/${configMapName}
+                                sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc logout
+                            """
+                        }else{
+                            try{
+                                sh"""
+                                    oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                    oc project ${ocpproject}
+                                    oc delete deploy ${appName}
+                                    oc delete service ${appName}
+                                    oc delete route ${appName}
+                                """
+                            }catch(Exception e){
+                                echo "clear deployment"
+                            }
+                            try{
+                                sh"""
+                                    oc delete istag ${appName}:${tagName}
+                                """
+                            }catch(Exception e){
+                                echo "new tag"
+                            }
+                            sh"""
+                                oc new-app --docker-image=${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc expose service/${appName} --port=3001-tcp
+                                oc set env deploy/${appName} --from=configmap/${configMapName}
+                                sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc logout
+                            """
+                        }
+                    }
+                    echo "success step 2"
+                }
+            }
+        }
+        // stage('Scan Accunetix') {
+        //     steps {
+        //         script{
+        //             step([$class: 'BuildScanner', incScan: false, incScanId: '', profile: '11111111-1111-1111-1111-111111111111', repTemp: 'no_report', stopScan: true, stopTargetScans: false, svRep: false, target: '67898a7a-d99b-4b5a-a8d3-6b10b5d80673', threat: 'DoNotFail'])
+        //             echo "success step 5"
+        //         }
+        //     }
+        // }
+        stage('Scan ZAP') {
+            steps {
+                script{
+                    sleep 90
+                    sh"""
+                        ${zapDir}/zap.sh -cmd -port ${8085} -quickurl ${zapScanUrl} -quickprogress -quickout $WORKSPACE/${appName}-report.html
+                    """
+                    echo "success step 5"
+                }
+            }
+        }
+    }
+}

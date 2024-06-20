@@ -1,0 +1,103 @@
+/*
+ * parameter should exists : 
+ * - tag        = string default(latest)
+ * - buildType  = dropdown [pull-only]
+ * - restartPod = boolean
+ *
+ */
+
+// artifactory
+def url = 'http://10.1.3.177:8082/artifactory/'
+def repo = "aggregator-v3-redis"
+def jfrogurl = "jfrogartifactory.jasamarga.co.id"
+def tagName = env.tag
+
+// ocp 
+def ocpurl = "https://devmaster01.ocdev.jasamarga.co.id:6443/"
+def ocpproject = "aggregator-postgres-v3"
+def appName = "aggregator-v3-redis"
+def isNotNewApp = false
+def appUrl = '' // updated after deployed to ocp
+def webhookKey = 'aggregator-postgres-v3'
+def configMapName = "aggregator-v3-redis-configmap"
+
+// deployment file
+def repoDeploymentFile = "https://gitlab.jasamarga.co.id:8081/riandycandra/devops-deployment-ocp.git"
+def deploymentPath = "aggregator-postgres-v3/aggregator-v3-redis.yaml"
+def deploymentFile = "aggregator-v3-redis.yaml"
+
+// jenkins param
+def buildType = env.buildType
+def restartPod = env.restartPod
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    environment {
+        GIT_CREDENTIALS = credentials('gitlab-root')
+    }
+    stages {
+        stage('create image and push artifactory') {
+            steps {
+                script{
+                    if(env.buildType == 'pull-only') {
+                      sh """
+                        git clone ${repoDeploymentFile}
+                        mv "${WORKSPACE}/devops-deployment-ocp/${deploymentPath}" "${WORKSPACE}"
+                        rm -rf "${WORKSPACE}/devops-deployment-ocp"
+                        sudo podman pull redis
+                      """
+                    }
+                    echo "success creating and building image"
+                }
+            }
+        }
+        
+        stage('Deployment To OCP') {
+          steps {
+              script{
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'ocp-dev',usernameVariable: 'ocpUsername', passwordVariable: 'ocpPassword']]) { 
+                  try{
+                    sh"""
+                      oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                      oc project ${ocpproject}
+                      oc delete istag ${appName}:${tagName}
+                    """
+                  }catch(Exception e){
+                    echo "new tag"
+                  }
+                  sh """
+                    oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                    oc project ${ocpproject}
+                    oc adm policy add-scc-to-user anyuid -z default
+                    sed -i 's,{NAMESPACE},${ocpproject},g' "$WORKSPACE/${deploymentFile}"
+                    sed -i 's,{CONFIGMAP_NAME},${configMapName},g' "$WORKSPACE/${deploymentFile}"
+                    sed -i 's,{IMAGE_DEPLOY},docker.io/library/redis:latest,g' "$WORKSPACE/${deploymentFile}"
+                    oc apply  -n '${ocpproject}' -f "$WORKSPACE/${deploymentFile}"
+                                    oc annotate route ${appName} --overwrite haproxy.router.openshift.io/timeout=5000s
+                                    oc set resources deploy/${appName} --limits=cpu=1,memory=1Gi --requests=cpu=100m,memory=500Mi
+                    oc rollout status deployment/'${appName}' -n '${ocpproject}'
+                    oc logout
+                    sudo podman rmi docker.io/library/redis:latest
+                  """
+                }
+                if(env.restartPod == 'true') {
+                  withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'ocp-dev',usernameVariable: 'ocpUsername', passwordVariable: 'ocpPassword']]) { 
+                      try {
+                        sh """
+                        oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                        oc project ${ocpproject}
+                        oc rollout restart deployment/'${appName}' 
+                        """
+                      } catch(Exception e) {
+                          echo ${e}
+                      }
+                  }
+                }
+                echo "success creating ocp project"
+              }
+            }
+        }
+    }
+}

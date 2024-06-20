@@ -1,0 +1,112 @@
+//artifactory
+def url = 'http://10.1.3.177:8082/artifactory/'
+def repo = "jmclick"
+def jfrogurl = "jfrogartifactory.jasamarga.co.id"
+
+def appName = "jmclick-be"
+def tagName = env.tag
+
+def ocpurl = "https://api.ocprd.jasamarga.co.id:6443"
+def ocpproject = "jmclick-prd"
+
+def configMap = "jmclick-config-prd"
+
+def isNotNewApp = false
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    stages {
+        
+        stage('preparation') {
+            steps {
+                script{
+                    cleanWs()
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'devops-artifactory',usernameVariable: 'artifactoryUsername', passwordVariable: 'artifactoryPassword']]) {
+                            sh"""
+                                sudo podman login -u ${artifactoryUsername} -p ${artifactoryPassword} ${jfrogurl}
+                                sudo podman pull ${jfrogurl}/${repo}/${appName}:${tagName}
+                            """
+                    } 
+                    echo "success step 1"
+                }
+            }
+        }
+        
+        stage('Deployment To OCP') {
+            steps {
+                script{
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'ocp-prd',usernameVariable: 'ocpUsername', passwordVariable: 'ocpPassword']]) { 
+                        sh"""
+                            oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                            oc project ${ocpproject}
+                        """
+                        String pod = sh(script:"oc get pod", returnStdout: true).toString().trim()
+                        echo "value pod "+pod
+                        if(pod.contains("${appName}")){
+                            isNotNewApp = true
+                        }else{
+                            isNotNewApp = false
+                        }
+                        if(isNotNewApp){
+                            sh"""
+                                oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                oc project ${ocpproject}
+                                oc delete deploy ${appName}
+                                oc delete service ${appName}
+                                oc delete route ${appName}
+                            """
+                            try{
+                                sh"""
+                                    oc delete istag ${appName}:${tagName}
+                                """
+                            }catch(Exception e){
+                                echo "new tag"
+                            }
+                            sleep 120
+                            sh"""
+                                oc new-app --docker-image=${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc expose service/${appName} --port=3000-tcp
+                                oc set env deploy/jmclick-be --from=configmap/${configMap}
+                                oc annotate route ${appName} --overwrite haproxy.router.openshift.io/timeout=120s
+                                oc scale deploy/${appName} --replicas=3
+                                sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc logout
+                            """
+                        }else{
+                            try{
+                                sh"""
+                                    oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                    oc project ${ocpproject}
+                                    oc delete deploy ${appName}
+                                    oc delete service ${appName}
+                                    oc delete route ${appName}
+                                """
+                            }catch(Exception e){
+                                echo "clear deployment"
+                            }
+                            try{
+                                sh"""
+                                    oc delete istag ${appName}:${tagName}
+                                """
+                            }catch(Exception e){
+                                echo "new tag"
+                            }
+                            sh"""
+                                oc new-app --docker-image=${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc expose service/${appName} --port=3000-tcp
+                                oc set env deploy/jmclick-be --from=configmap/${configMap}
+                                oc annotate route ${appName} --overwrite haproxy.router.openshift.io/timeout=120s
+                                oc scale deploy/${appName} --replicas=3
+                                sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc logout
+                            """
+                        }
+                    }
+                    echo "success step 2"
+                }
+            }
+        }
+    }
+}

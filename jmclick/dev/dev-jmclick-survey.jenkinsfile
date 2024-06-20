@@ -1,0 +1,156 @@
+def gitRepo = "http://bitbucket.jasamarga.co.id:7990/scm/jc/jm-click-survey.git"
+def gitRepo2 = "http://bitbucket.jasamarga.co.id:7990/scm/jen/dockerfile.git"
+def branch = "main"
+//artifactory
+def url = 'http://10.1.3.177:8082/artifactory/'
+def repo = "jmclick"
+def jfrogurl = "jfrogartifactory.jasamarga.co.id"
+
+def ocpurl = "https://api.ocdev.jasamarga.co.id:6443/"
+
+def appName = "jmclick-survey"
+def tagName = env.tag
+
+def isNotNewApp = false
+
+def ocpproject = "jmclick-dev"
+
+def sonarUrl = "http://10.1.3.189:9000"
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    environment {
+        GIT_CREDENTIALS = credentials('bitbucket')
+    }
+    stages {
+        stage('Clone') {
+            steps {
+                script{
+                    cleanWs()
+                    checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'bitbucket', url: "${gitRepo}"]], branches: [[name: "${branch}"]]]
+                    sh"""
+                        mv .env.example .env
+                        npm install
+                    """
+                    echo "success step 1"
+                }
+            }
+        }
+        
+        
+        stage('SonarQube Scan') {
+            steps {
+                script{
+                    sh """
+                        /app/sonar-scanner/bin/sonar-scanner \
+                        -Dsonar.projectKey=JMCLICK-SURVEY \
+                        -Dsonar.sources=. \
+                        -Dsonar.host.url=${sonarUrl} \
+                        -Dsonar.login=ca82abfb63af23e98392a48ff1d14f3c6652a46c
+                    """ 
+                    echo "success step 2"
+                }
+            }
+        }
+        
+        stage('create image and push artifactory') {
+            steps {
+                script{
+                    sh"""
+                        git config --global credential.username $GIT_CREDENTIALS_USR
+                        git config --global credential.helper "!echo password=$GIT_CREDENTIALS_PSW; echo"
+
+                        git clone ${gitRepo2}
+
+                        cp ${WORKSPACE}/dockerfile/jmclick/Dockerfile-jmclick-survey ${WORKSPACE}
+
+                        rm -rf ${WORKSPACE}/dockerfile
+                    """ 
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'devops-artifactory',usernameVariable: 'artifactoryUsername', passwordVariable: 'artifactoryPassword']]) { 
+                        sh"""
+                            sudo podman build -t ${appName}:${tagName} -f ${WORKSPACE}/Dockerfile-jmclick-survey
+                            sudo podman login -u ${artifactoryUsername} -p ${artifactoryPassword} ${jfrogurl}
+                            sudo podman tag ${appName}:${tagName} ${jfrogurl}/${repo}/${appName}:${tagName}
+                            sudo podman push ${jfrogurl}/${repo}/${appName}:${tagName}
+                        """
+                    } 
+                    echo "success step 3"
+                }
+            }
+        }
+        
+        stage('Deployment To OCP') {
+            steps {
+                script{
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'ocp-jmclick-be',usernameVariable: 'ocpUsername', passwordVariable: 'ocpPassword']]) { 
+                        sh"""
+                            oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                            oc project ${ocpproject}
+                        """
+                        String pod = sh(script:"oc get pod", returnStdout: true).toString().trim()
+                        echo "value pod "+pod
+                        if(pod.contains("${appName}")){
+                            isNotNewApp = true
+                        }else{
+                            isNotNewApp = false
+                        }
+                        if(isNotNewApp){
+                            sh"""
+                                oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                oc project ${ocpproject}
+                                oc delete deploy ${appName}
+                                oc delete service ${appName}
+                                oc delete route ${appName}
+                            """
+                            try{
+                                sh"""
+                                    oc delete istag ${appName}:${tagName}
+                                """
+                            }catch(Exception e){
+                                echo "new tag"
+                            }
+                            sleep 120
+                            sh"""
+                                oc new-app --docker-image=${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc expose service/${appName} --port=3001-tcp
+                                oc scale deploy/${appName} --replicas=3
+                                sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc logout
+                            """
+                        }else{
+                            try{
+                                sh"""
+                                    oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                    oc project ${ocpproject}
+                                    oc delete deploy ${appName}
+                                    oc delete service ${appName}
+                                    oc delete route ${appName}
+                                """
+                            }catch(Exception e){
+                                echo "clear deployment"
+                            }
+                            try{
+                                sh"""
+                                    oc delete istag ${appName}:${tagName}
+                                """
+                            }catch(Exception e){
+                                echo "new tag"
+                            }
+                            sh"""
+                                oc new-app --docker-image=${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc expose service/${appName} --port=3001-tcp
+                                oc annotate route ${appName} --overwrite haproxy.router.openshift.io/timeout=120s
+                                oc scale deploy/${appName} --replicas=3
+                                sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc logout
+                            """
+                        }
+                    } 
+                    echo "success step 4"
+                }
+            }
+        }
+    }
+}

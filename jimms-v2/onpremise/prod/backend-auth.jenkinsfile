@@ -1,0 +1,58 @@
+/*
+ * parameter should exists : 
+ * - tag        = string
+ *
+ */
+
+
+
+// artifactory
+def url = 'http://10.1.3.177:8082/artifactory/'
+def repo = "jimms-v2"
+def jfrogurl = "jfrogartifactory.jasamarga.co.id"
+def tagName = env.tag
+def appName = "be-auth"
+
+def ip = "10.1.12.71"
+def envPath = "/var/www/html/jimms-v2/be-auth/env"
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    stages {
+
+		stage('Preparation') {
+			steps {
+				script {
+					if(tagName.trim() == '') {
+						error("TAG is required, process aborted.")
+					} else {
+						echo "Using tag : ${tagName}"
+					}
+				}
+			}
+		}
+        
+        stage('Deployment') {
+            steps {
+                script{
+                    sshagent(credentials: ['ssh-jenkins']) {
+                        // Inside the SSH agent, run SSH command to change directory
+
+                        sh """
+                            ssh root@${ip} "
+                            docker pull ${jfrogurl}/${repo}/${appName}:${tagName}; 
+                            docker kill jimms-be-auth-1 && docker rm jimms-be-auth-1 2>&1 >/dev/null;
+                            docker kill jimms-be-auth-2 && docker rm jimms-be-auth-2 2>&1 >/dev/null;
+                            docker run --env-file=${envPath} -d -p 8003:8181 --name=jimms-be-auth-1 ${jfrogurl}/${repo}/${appName}:${tagName};
+                            docker run --env-file=${envPath} -d -p 8004:8181 --name=jimms-be-auth-2 ${jfrogurl}/${repo}/${appName}:${tagName};
+                            "
+                        """
+                    }
+                    echo "success step 5"
+                }
+            }
+        }
+    }
+}

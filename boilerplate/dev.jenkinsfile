@@ -1,0 +1,168 @@
+def gitRepo1 = "http://bitbucket.jasamarga.co.id:7990/scm/hw/boilerplate-api.git"
+
+// def gitRepo2 = "http://bitbucket.jasamarga.co.id:7990/scm/jen/dockerfile.git"
+def branch1 = "master"
+//artifactory
+def url = 'http://10.1.3.177:8082/artifactory/'
+def repo = "boilerplate-api"
+def jfrogurl = "jfrogartifactory.jasamarga.co.id"
+
+def sonarUrl = "http://10.1.3.189:9000"
+
+def ocpurl = "https://api.ocdev.jasamarga.co.id:6443/"
+def ocpproject = "boilerplate-api"
+
+def appName = "boilerplate-api"
+def tagName = env.tags
+
+// nama configMap
+def configMapName = "config-map"
+
+// nama project sonarqube
+def sonarqubeProject = "boilerplate-api"
+
+def isNotNewApp = false
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    environment {
+        GIT_CREDENTIALS = credentials('bitbucket')
+    }
+    stages {
+        stage('Clone') {
+            steps {
+                script{
+                    cleanWs()
+                    checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'bitbucket', url: "${gitRepo1}"]], branches: [[name: "${branch1}"]]]
+                    echo "success step 1"
+                }
+            }
+        }
+
+		// stage('Checkout dari pipeline generated di jenkins') {
+		// 	steps {
+		// 		script {
+		// 			checkout BbS(branches: [[name: 'development']], credentialsId: 'bitbucket-admin-user-pass', extensions: [], id: '36119110-9664-4023-a179-f434bb53823c', mirrorName: '', projectName: 'JIMMS', repositoryName: 'JIMMS', serverId: 'aeee9edc-a522-45ee-8c23-719b543f9334', sshCredentialsId: '')
+		// 		}
+		// 	}
+		// }
+
+        // stage('Unit Test') {
+        //     steps {
+        //         script{
+        //             sh"""
+        //                 PHP artisan test
+        //             """
+        //             echo "success step 2"
+        //         }
+        //     }
+        // }
+
+
+        stage('SonarQube Scan') {
+            steps {
+                script{
+                    sh"""
+                        /app/sonar-scanner/bin/sonar-scanner \
+						-Dsonar.projectKey=boilerplate-api \
+						-Dsonar.sources=app,resources \
+						-Dsonar.language=php \
+						-Dsonar.sourceEncoding=UTF-8 \
+						-Dsonar.exclusions=app/Providers/**,vendor/** \
+						-Dsonar.host.url=${sonarUrl} \
+						-Dsonar.login=0009f625b845ee022ee8857dd72e50c6c96aec65
+                    """
+//
+//                     def status = sh(script:"curl http://admin:S0narqub3!@10.1.3.189:9000/api/qualitygates/get_by_project?project=jm-innovation", returnStdout: true).trim()
+//                     if(status.contains("false")){
+//                         error("Hasil Scanning Sonarqube Failed")
+//                     }
+                    echo "success step 3"
+                }
+            }
+        }
+
+        stage('create image and push artifactory') {
+            steps {
+                script{
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'devops-artifactory',usernameVariable: 'artifactoryUsername', passwordVariable: 'artifactoryPassword']]) {
+                        sh"""
+                            sudo podman login -u ${artifactoryUsername} -p ${artifactoryPassword} ${jfrogurl}
+                            sudo podman build -t  ${jfrogurl}/${repo}/${appName}:${tagName} -f ${WORKSPACE}/dockerfile
+                            sudo podman push ${jfrogurl}/${repo}/${appName}:${tagName}
+                        """
+                        // sudo podman build -t  ${jfrogurl}/${repo}/${appName}:${tagName} -f ${WORKSPACE}/jimms.dockerfile
+                    }
+                    echo "success step 4"
+                }
+            }
+        }
+
+        stage('Deployment To OCP') {
+            steps {
+                script{
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'ocp-dev',usernameVariable: 'ocpUsername', passwordVariable: 'ocpPassword']]) {
+                        sh"""
+                            oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                            oc project ${ocpproject}
+                        """
+                        String pod = sh(script:"oc get pod", returnStdout: true).toString().trim()
+                        echo "value pod "+pod
+                        if(pod.contains("${appName}")){
+                            isNotNewApp = true
+                        }else{
+                            isNotNewApp = false
+                        }
+                        if(isNotNewApp){
+                            sh"""
+                                oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                oc project ${ocpproject}
+                                oc delete deploy ${appName}
+                                oc delete service ${appName}
+                                oc delete route ${appName}
+                            """
+                            try{
+                                sh"""
+                                    oc delete istag ${appName}:${tagName}
+                                """
+                            }catch(Exception e){
+                                echo "new tag"
+                            }
+                            sleep 120
+                            sh"""
+                            
+                                oc adm policy add-scc-to-user anyuid -z default
+                                oc new-app --docker-image=${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc expose service/${appName} --port=8181-tcp
+                                oc set env deploy/${appName} --from=configmap/${configMapName}
+                                sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc logout
+                            """
+                        }else{
+                            try{
+                                sh"""
+                                    oc delete istag ${appName}:${tagName}
+                                """
+                            }catch(Exception e){
+                                echo "new tag"
+                            }
+                            sh"""
+                                oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                oc project ${ocpproject}
+                                oc adm policy add-scc-to-user anyuid -z default
+                                oc new-app --docker-image=${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc expose service/${appName} --port=8181-tcp
+                                oc set env deploy/${appName} --from=configmap/${configMapName}
+                                sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc logout
+                            """
+                        }
+                    }
+                    echo "success step 5"
+                }
+            }
+        }
+    }
+}

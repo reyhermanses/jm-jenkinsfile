@@ -1,0 +1,42 @@
+pipeline {
+    agent {
+        node {
+            label "Agent Server 238"
+        }
+    }
+    environment {
+        DISCORD_URL = credentials('discord-webhook')
+        SSH_CREDENTIALS = credentials('ssh-238')
+    }
+    stages {
+        stage('Build Image') {
+            steps {
+                script {
+                  discordSend description: "Job Started", footer: "Picture Update Production", link: env.BUILD_URL, result: currentBuild.currentResult, title: "Picture Update Build ID ${env.BUILD_ID}", webhookURL: DISCORD_URL
+                  sh """
+                      cd /var/www/html/picture_update
+                      pwd
+                      git pull
+                      docker stop picture_update || true
+                      docker rm picture_update || true
+                      docker rmi picture_update
+                      docker build -t picture_update .
+                      docker run --name=picture_update -d -p 10001:80 picture_update || true
+                  """
+                }
+            }
+        }
+    }
+    post {
+        success {
+            script {
+                discordSend description: "Job Run Successfully", footer: "Picture Update Production", link: env.BUILD_URL, result: currentBuild.currentResult, title: "Picture Update Build ID ${env.BUILD_ID}", webhookURL: DISCORD_URL
+            }
+        }
+        failure {
+            script {
+                discordSend description: "Job Failed", footer: "Picture Update Production", link: env.BUILD_URL, result: currentBuild.currentResult, title: "Picture Update Build ID ${env.BUILD_ID}", webhookURL: DISCORD_URL
+            }
+        }
+    }
+}

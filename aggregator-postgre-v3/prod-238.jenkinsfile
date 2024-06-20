@@ -1,0 +1,146 @@
+def jfrogurl = "jfrogartifactory.jasamarga.co.id"
+def repo = "aggregator-postgres-v3"
+def appName = "aggregator-postgres-v3"
+
+pipeline {
+    agent {
+        node {
+            label "Agent Server 238"
+        }
+    }
+    environment {
+        DISCORD_URL = credentials('discord-webhook')
+    }
+    stages {
+        stage('Pull From Artifact') {
+            steps {
+                script {
+                    discordSend description: "Job Started", footer: "Aggregator Production 238", link: env.BUILD_URL, result: currentBuild.currentResult, title: "Aggregator Build ID ${env.BUILD_ID}", webhookURL: DISCORD_URL
+                    withCredentials([usernamePassword(credentialsId: 'devops-artifactory', passwordVariable: 'DOCKER_PASSWORD', usernameVariable: 'DOCKER_USERNAME')]) {
+                        def dockerHubCredentials = "-u ${env.DOCKER_USERNAME} -p ${env.DOCKER_PASSWORD}"
+                        
+                        sh "docker login ${dockerHubCredentials} ${jfrogurl}"
+                        sh "docker pull ${jfrogurl}/${repo}/${appName}:${params.tags}"
+                    }
+                }
+            }
+        }
+        stage('Build Image') {
+            steps {
+                script {
+                    script {
+                        // Cleaning Current Docker COntainer
+                        sh """
+                            docker stop aggregator-v3-prod-1 || true;
+                            docker stop aggregator-v3-prod-2 || true;
+                            docker stop aggregator-v3-prod-3 || true;
+                            docker stop aggregator-v3-prod-4 || true;
+                            docker stop aggregator-v3-prod-5 || true;
+                            docker stop aggregator-v3-prod-6 || true;
+                            docker stop aggregator-v3-prod-7 || true;
+                            docker stop aggregator-v3-prod-8 || true;
+                            docker rm aggregator-v3-prod-1 || true;
+                            docker rm aggregator-v3-prod-2 || true;
+                            docker rm aggregator-v3-prod-3 || true;
+                            docker rm aggregator-v3-prod-4 || true;
+                            docker rm aggregator-v3-prod-5 || true;
+                            docker rm aggregator-v3-prod-6 || true;
+                            docker rm aggregator-v3-prod-7 || true;
+                            docker rm aggregator-v3-prod-8 || true;
+                        """
+
+                        sh 'cp /var/www/html/aggregator-mapping-v3/.env .'
+
+                        def envVars = readFile('.env').readLines().findAll { line -> line.trim() && !line.trim().startsWith('#') }
+
+                        // Running Cluster
+                        def cluster1 = [
+                            'docker', 'run', '-d',
+                            '-p', '9002:8080',
+                            *envVars.collect { "-e '${it.split('=')[0]}'='${it.split('=')[1]}'" }.flatten(),
+                            '--name aggregator-v3-prod-1',
+                            "${jfrogurl}/${repo}/${appName}:${params.tags}"
+                        ]
+                        
+                        def cluster2 = [
+                            'docker', 'run', '-d',
+                            '-p', '9003:8080',
+                            *envVars.collect { "-e '${it.split('=')[0]}'='${it.split('=')[1]}'" }.flatten(),
+                            '--name aggregator-v3-prod-2',
+                            "${jfrogurl}/${repo}/${appName}:${params.tags}"
+                        ]
+                        
+                        def cluster3 = [
+                            'docker', 'run', '-d',
+                            '-p', '9004:8080',
+                            *envVars.collect { "-e '${it.split('=')[0]}'='${it.split('=')[1]}'" }.flatten(),
+                            '--name aggregator-v3-prod-3',
+                            "${jfrogurl}/${repo}/${appName}:${params.tags}"
+                        ]
+                        
+                        def cluster4 = [
+                            'docker', 'run', '-d',
+                            '-p', '9005:8080',
+                            *envVars.collect { "-e '${it.split('=')[0]}'='${it.split('=')[1]}'" }.flatten(),
+                            '--name aggregator-v3-prod-4',
+                            "${jfrogurl}/${repo}/${appName}:${params.tags}"
+                        ]
+                        
+                        def cluster5 = [
+                            'docker', 'run', '-d',
+                            '-p', '9006:8080',
+                            *envVars.collect { "-e '${it.split('=')[0]}'='${it.split('=')[1]}'" }.flatten(),
+                            '--name aggregator-v3-prod-5',
+                            "${jfrogurl}/${repo}/${appName}:${params.tags}"
+                        ]
+                        
+                        def cluster6 = [
+                            'docker', 'run', '-d',
+                            '-p', '9007:8080',
+                            *envVars.collect { "-e '${it.split('=')[0]}'='${it.split('=')[1]}'" }.flatten(),
+                            '--name aggregator-v3-prod-6',
+                            "${jfrogurl}/${repo}/${appName}:${params.tags}"
+                        ]
+                        
+                        def cluster7 = [
+                            'docker', 'run', '-d',
+                            '-p', '9008:8080',
+                            *envVars.collect { "-e '${it.split('=')[0]}'='${it.split('=')[1]}'" }.flatten(),
+                            '--name aggregator-v3-prod-7',
+                            "${jfrogurl}/${repo}/${appName}:${params.tags}"
+                        ]
+                        
+                        def cluster8 = [
+                            'docker', 'run', '-d',
+                            '-p', '9009:8080',
+                            *envVars.collect { "-e '${it.split('=')[0]}'='${it.split('=')[1]}'" }.flatten(),
+                            '--name aggregator-v3-prod-8',
+                            "${jfrogurl}/${repo}/${appName}:${params.tags}"
+                        ]
+
+                        sh cluster1.join(' ')
+                        sh cluster2.join(' ')
+                        sh cluster3.join(' ')
+                        sh cluster4.join(' ')
+                        sh cluster5.join(' ')
+                        sh cluster6.join(' ')
+                        sh cluster7.join(' ')
+                        sh cluster8.join(' ')
+                    }
+                }
+            }
+        }
+    }
+    post {
+        success {
+            script {
+                discordSend description: "Job Run Successfully", footer: "Aggregator Production 238", link: env.BUILD_URL, result: currentBuild.currentResult, title: "Aggregator Build ID ${env.BUILD_ID}", webhookURL: DISCORD_URL
+            }
+        }
+        failure {
+            script {
+                discordSend description: "Job Failed", footer: "Aggregator Production 238", link: env.BUILD_URL, result: currentBuild.currentResult, title: "Aggregator Build ID ${env.BUILD_ID}", webhookURL: DISCORD_URL
+            }
+        }
+    }
+}

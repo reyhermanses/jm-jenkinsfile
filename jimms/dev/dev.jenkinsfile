@@ -1,0 +1,166 @@
+def gitRepo1 = "http://bitbucket.jasamarga.co.id:7990/scm/jim/jimms.git"
+def gitRepo2 = "http://bitbucket.jasamarga.co.id:7990/scm/jen/deployment-ocp.git"
+def branch1 = "master"
+//artifactory
+def url = 'http://10.1.3.177:8082/artifactory/'
+def repo = "jimms"
+def jfrogurl = "jfrogartifactory.jasamarga.co.id"
+
+def sonarUrl = "http://10.1.3.189:9000"
+
+def ocpurl = "https://api.ocdev.jasamarga.co.id:6443/"
+def ocpproject = "jimms-dev"
+
+def appName = "jimms"
+def tagName = env.tag
+
+def configMapName = "jimms-config-dev"
+
+def isNotNewApp = false
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    environment {
+        GIT_CREDENTIALS = credentials('bitbucket')
+    }
+    stages {
+        stage('Clone') {
+            steps {
+                script{
+                    cleanWs()
+                    checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'bitbucket', url: "${gitRepo1}"]], branches: [[name: "${branch1}"]]]                  
+                    echo "success step 1"
+                }
+            }
+        }
+        stage('SonarQube Scan') {
+            steps {
+                script{
+                    // sh"""
+                    //     /app/sonar-scanner/bin/sonar-scanner \
+                    //     -D"sonar.projectKey=JIMMS" \
+                    //     -D"sonar.sources=." \
+                    //     -D"sonar.host.url=${sonarUrl}" \
+                    //     -D"sonar.login=e69af734753e3cde8a8f6af99df18ae327a31182"
+                    // """
+
+                    // def status = sh(script:"curl http://admin:S0narqub3!@10.1.3.189:9000/api/qualitygates/get_by_project?project=JIMMS", returnStdout: true).trim()
+                    // if(status.contains("false")){
+                    //     error("Hasil Scanning Sonarqube Failed")
+                    // }
+                    echo "success step 3"
+                }
+            }
+        }
+
+        stage('create image and push artifactory') {
+            steps {
+                script{
+                    sh"""
+                        git config --global credential.username $GIT_CREDENTIALS_USR
+                        git config --global credential.helper "!echo password=$GIT_CREDENTIALS_PSW; echo"
+
+                        git clone ${gitRepo2}
+
+                        mv ${WORKSPACE}/deployment-ocp/jimms/jimms.yaml ${WORKSPACE}
+                        rm -rf ${WORKSPACE}/deployment-ocp
+                    """
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'devops-artifactory',usernameVariable: 'artifactoryUsername', passwordVariable: 'artifactoryPassword']]) { 
+                        sh"""
+                            sudo podman login -u ${artifactoryUsername} -p ${artifactoryPassword} ${jfrogurl}
+                            sudo podman build -t  ${jfrogurl}/${repo}/${appName}:${tagName} -f ${WORKSPACE}/dockerfile
+                            sudo podman push ${jfrogurl}/${repo}/${appName}:${tagName}
+                        """
+                    } 
+                    echo "success step 4"
+                }
+            }
+        }
+        
+        stage('Deployment To OCP') {
+            steps {
+                script{
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'ocp-jimms',usernameVariable: 'ocpUsername', passwordVariable: 'ocpPassword']]) { 
+                        try{
+                            sh"""
+                                oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                oc project ${ocpproject}
+                                oc delete istag ${appName}:${tagName}
+                            """
+                        }catch(Exception e){
+                            echo "new tag"
+                        }
+                        sh """
+                            oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                            oc project ${ocpproject}
+                            sed -i 's,{NAMESPACE},${ocpproject},g' "$WORKSPACE/jimms.yaml"
+                            sed -i 's,{CONFIGMAP_NAME},${configMapName},g' "$WORKSPACE/jimms.yaml"
+                            sed -i 's,{IMAGE_DEPLOY},${jfrogurl}/${repo}/${appName}:${tagName},g' "$WORKSPACE/jimms.yaml"
+                            oc apply  -n '${ocpproject}' -f $WORKSPACE/jimms.yaml
+                            oc rollout status deployment/'${appName}' -n '${ocpproject}'
+                            oc logout
+                            sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                        """
+                        
+                        
+                        // sh"""
+                        //     oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                        //     oc project ${ocpproject}
+                        // """
+                        // String pod = sh(script:"oc get pod", returnStdout: true).toString().trim()
+                        // echo "value pod "+pod
+                        // if(pod.contains("${appName}")){
+                        //     isNotNewApp = true
+                        // }else{
+                        //     isNotNewApp = false
+                        // }
+                        // if(isNotNewApp){
+                        //     sh"""
+                        //         oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                        //         oc project ${ocpproject}
+                        //         oc delete deploy ${appName}
+                        //         oc delete service ${appName}
+                        //         oc delete route ${appName}
+                        //     """
+                        //     try{
+                        //         sh"""
+                        //             oc delete istag ${appName}:${tagName}
+                        //         """
+                        //     }catch(Exception e){
+                        //         echo "new tag"
+                        //     }
+                        //     sleep 120
+                        //     sh"""
+                        //         oc new-app --docker-image=${jfrogurl}/${repo}/${appName}:${tagName}
+                        //         oc expose service/${appName} --port=8181-tcp
+                        //         oc set env deploy/${appName} --from=configmap/${configMapName}
+                        //         sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                        //         oc logout
+                        //     """
+                        // }else{
+                        //     try{
+                        //         sh"""
+                        //             oc delete istag ${appName}:${tagName}
+                        //         """
+                        //     }catch(Exception e){
+                        //         echo "new tag"
+                        //     }
+                        //     sh"""
+                        //         oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                        //         oc project ${ocpproject}
+                        //         oc new-app --docker-image=${jfrogurl}/${repo}/${appName}:${tagName}
+                        //         oc expose service/${appName} --port=8181-tcp
+                        //         oc set env deploy/${appName} --from=configmap/${configMapName}
+                        //         sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                        //         oc logout
+                        //     """
+                        // }
+                    }
+                    echo "success step 5"
+                }
+            }
+        }
+    }
+}

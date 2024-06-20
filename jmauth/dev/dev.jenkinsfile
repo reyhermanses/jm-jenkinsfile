@@ -1,0 +1,149 @@
+def gitRepo1 = "http://bitbucket.jasamarga.co.id:7990/scm/ad/jm-auth.git"
+def gitRepo2 = "http://bitbucket.jasamarga.co.id:7990/scm/jen/dockerfile.git"
+def branch1 = "master"
+//artifactory
+def url = 'http://10.1.3.177:8082/artifactory/'
+def repo = "agregator-data"
+def jfrogurl = "jfrogartifactory.jasamarga.co.id"
+
+def sonarUrl = "http://10.1.3.189:9000"
+
+def ocpurl = "https://api.ocdev.jasamarga.co.id:6443/"
+def ocpproject = "agregator-data-dev"
+
+def appName = "jmauth"
+def tagName = env.tag
+def configMapName = "jmauth-config-dev"
+
+def isNotNewApp = false
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    environment {
+        GIT_CREDENTIALS = credentials('bitbucket')
+    }
+    stages {
+        stage('Clone') {
+            steps {
+                script{
+                    cleanWs()
+                    checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'bitbucket', url: "${gitRepo1}"]], branches: [[name: "${branch1}"]]]                  
+                    echo "success step 1"
+                }
+            }
+        }
+        
+        stage('SonarQube Scan') {
+            steps {
+                script{
+                    sh"""
+                        /app/sonar-scanner/bin/sonar-scanner \
+                            -Dsonar.projectKey=JMAUTH \
+                            -Dsonar.sources=. \
+                            -Dsonar.host.url=${sonarUrl} \
+                            -Dsonar.login=d72b625746a9f560119a38f8811f5828ca57b0ea
+                    """
+                    echo "success step 2"
+                }
+            }
+        }
+        
+        stage('create image and push artifactory') {
+            steps {
+                script{
+                    sh"""
+                        rm -rf ${WORKSPACE}/Dockerfile
+
+                        git config --global credential.username $GIT_CREDENTIALS_USR
+                        git config --global credential.helper "!echo password=$GIT_CREDENTIALS_PSW; echo"
+
+                        git clone ${gitRepo2}
+
+                        cp ${WORKSPACE}/dockerfile/jmauth/Dockerfile ${WORKSPACE}
+                    """ 
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'devops-artifactory',usernameVariable: 'artifactoryUsername', passwordVariable: 'artifactoryPassword']]) { 
+                        sh"""
+                            sudo podman login -u ${artifactoryUsername} -p ${artifactoryPassword} ${jfrogurl}
+                            sudo podman build -t  ${jfrogurl}/${repo}/${appName}:${tagName} -f ${WORKSPACE}/Dockerfile
+                            sudo podman push ${jfrogurl}/${repo}/${appName}:${tagName}
+                        """
+                    } 
+                    echo "success step 3"
+                }
+            }
+        }
+        
+        stage('Deployment To OCP') {
+            steps {
+                script{
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'ocp-dev',usernameVariable: 'ocpUsername', passwordVariable: 'ocpPassword']]) { 
+                        sh"""
+                            oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                            oc project ${ocpproject}
+                        """
+                        String pod = sh(script:"oc get pod", returnStdout: true).toString().trim()
+                        echo "value pod "+pod
+                        if(pod.contains("${appName}")){
+                            isNotNewApp = true
+                        }else{
+                            isNotNewApp = false
+                        }
+                        if(isNotNewApp){
+                            sh"""
+                                oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                oc project ${ocpproject}
+                                oc delete deploy ${appName}
+                                oc delete service ${appName}
+                                oc delete route ${appName}
+                            """
+                            try{
+                                sh"""
+                                    oc delete istag ${appName}:${tagName}
+                                """
+                            }catch(Exception e){
+                                echo "new tag"
+                            }
+                            sleep 120
+                            sh"""
+                                oc new-app --docker-image=${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc expose service/${appName} --port=3001-tcp
+                                oc set env deploy/${appName} --from=configmap/${configMapName}
+                                sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc logout
+                            """
+                        }else{
+                            try{
+                                sh"""
+                                    oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                    oc project ${ocpproject}
+                                    oc delete deploy ${appName}
+                                    oc delete service ${appName}
+                                    oc delete route ${appName}
+                                """
+                            }catch(Exception e){
+                                echo "clear deployment"
+                            }
+                            try{
+                                sh"""
+                                    oc delete istag ${appName}:${tagName}
+                                """
+                            }catch(Exception e){
+                                echo "new tag"
+                            }
+                            sh"""
+                                oc new-app --docker-image=${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc expose service/${appName} --port=3001-tcp
+                                oc set env deploy/${appName} --from=configmap/${configMapName}
+                                sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc logout
+                            """
+                        }
+                    }  
+                    echo "success step 4"
+                }
+            }
+        }
+    }
+}

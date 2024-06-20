@@ -1,0 +1,133 @@
+def gitRepo1 = "git@github.com:it-jasamarga/aggregator_api.git"
+def branch1 = "develop"
+//artifactory
+def url = 'http://10.1.3.177:8082/artifactory/'
+def repo = "agregator-data"
+def jfrogurl = "jfrogartifactory.jasamarga.co.id"
+
+def sonarUrl = "http://10.1.3.189:9000"
+
+def ocpurl = "https://api.ocdev.jasamarga.co.id:6443/"
+def ocpproject = "agregator-data-dev"
+
+def appName = "agregatordata"
+def tagName = env.tag
+def configMapName = "agregator-config-dev"
+
+def isNotNewApp = false
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    environment {
+        GIT_CREDENTIALS = credentials('bitbucket')
+    }
+    stages {
+        stage('Clone') {
+            steps {
+                script{
+                    cleanWs()
+                    checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'github-jasamarga-jenkins-dev', url: "${gitRepo1}"]], branches: [[name: "${branch1}"]]]                  
+                    echo "success step 1"
+                }
+            }
+        }
+        
+        stage('SonarQube Scan') {
+            steps {
+                script{
+                    sh"""
+                        /app/sonar-scanner/bin/sonar-scanner \
+                        -Dsonar.projectKey=AD_api \
+                        -Dsonar.sources=. \
+                        -D"sonar.host.url=${sonarUrl}" \
+                        -Dsonar.login=41091b95047aaf252bce2e893cf7e434715c067f
+                    """
+                    echo "success step 2"
+                }
+            }
+        }
+        
+        stage('create image and push artifactory') {
+            steps {
+                script{
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'devops-artifactory',usernameVariable: 'artifactoryUsername', passwordVariable: 'artifactoryPassword']]) { 
+                        sh"""
+                            sudo podman login -u ${artifactoryUsername} -p ${artifactoryPassword} ${jfrogurl}
+                            sudo podman build -t  ${jfrogurl}/${repo}/${appName}:${tagName} -f ${WORKSPACE}/Dockerfile
+                            sudo podman push ${jfrogurl}/${repo}/${appName}:${tagName}
+                        """
+                    } 
+                    echo "success step 3"
+                }
+            }
+        }
+        
+        stage('Deployment To OCP') {
+            steps {
+                script{
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'ocp-aggdata',usernameVariable: 'ocpUsername', passwordVariable: 'ocpPassword']]) { 
+                        sh"""
+                            oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                            oc project ${ocpproject}
+                        """
+                        String pod = sh(script:"oc get pod", returnStdout: true).toString().trim()
+                        echo "value pod "+pod
+                        if(pod.contains("${appName}")){
+                            isNotNewApp = true
+                        }else{
+                            isNotNewApp = false
+                        }
+                        if(isNotNewApp){
+                            sh"""
+                                oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                oc project ${ocpproject}
+                                oc delete deploy ${appName}
+                                oc delete service ${appName}
+                                oc delete route ${appName}
+                            """
+                            sleep 120
+                            try{
+                                sh"""
+                                    oc delete istag ${appName}:${tagName}
+                                """
+                            }catch(Exception e){
+                                echo "new tag"
+                            }
+                            sh"""
+                                oc new-app --docker-image=${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc expose service/${appName} --port=8181-tcp
+                                oc set env deploy/${appName} --from=configmap/${configMapName}
+                                oc annotate route ${appName} --overwrite haproxy.router.openshift.io/timeout=180s
+                                sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc logout
+                            """
+                        }else{
+                            sh"""
+                                oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                oc project ${ocpproject}
+                            """
+                            try{
+                                sh"""
+                                    oc delete istag ${appName}:${tagName}
+                                """
+                            }catch(Exception e){
+                                echo "new tag"
+                            }
+                            sh"""
+                                oc new-app --docker-image=${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc expose service/${appName} --port=8181-tcp
+                                oc set env deploy/${appName} --from=configmap/${configMapName}
+                                oc annotate route ${appName} --overwrite haproxy.router.openshift.io/timeout=180s
+                                sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc logout
+                            """
+                        }
+                    }
+                    echo "success step 4"
+                }
+            }
+        }
+    }
+}

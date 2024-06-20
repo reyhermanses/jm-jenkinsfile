@@ -1,0 +1,157 @@
+// deployment file
+def repoDeploymentFile = "https://gitlab.jasamarga.co.id:8081/riandycandra/devops-deployment-ocp.git"
+def deploymentPath = "jm-act/jm-act.yaml"
+def deploymentFile = "jm-act.yaml"
+
+//artifactory
+def url = 'http://10.1.3.177:8082/artifactory/'
+def repo = "jm-act"
+def jfrogurl = "jfrogartifactory.jasamarga.co.id"
+
+def appName = "jm-act"
+def tagName = env.tag
+
+def ocpurl = "https://api.ocprd.jasamarga.co.id:6443"
+def ocpproject = "jm-act"
+def configMapName = "jm-act-configmap"
+
+def isNotNewApp = false
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    environment {
+        GIT_CREDENTIALS = credentials('gitlab-root')
+    }
+    stages {
+        stage('preparation') {
+            steps {
+                script{
+                    cleanWs()
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'devops-artifactory',usernameVariable: 'artifactoryUsername', passwordVariable: 'artifactoryPassword']]) {
+                            sh"""
+                                git config --global credential.username $GIT_CREDENTIALS_USR
+                                git config --global credential.helper "!echo password=$GIT_CREDENTIALS_PSW; echo"
+
+                                git clone ${repoDeploymentFile}
+
+                                mv "${WORKSPACE}/devops-deployment-ocp/${deploymentPath}" "${WORKSPACE}"
+								rm -rf "${WORKSPACE}/devops-deployment-ocp"
+                            """
+                            sh"""
+                                sudo podman login -u ${artifactoryUsername} -p ${artifactoryPassword} ${jfrogurl}
+                                sudo podman pull ${jfrogurl}/${repo}/${appName}:${tagName}
+                            """
+                    }  
+                    echo "success step 1"
+                }
+            }
+        }
+        
+        stage('Deployment To OCP') {
+            steps {
+                script{
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'ocp-prd',usernameVariable: 'ocpUsername', passwordVariable: 'ocpPassword']]) { 
+
+                        // V2
+                        // try{
+                        //     sh"""
+                        //         oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                        //         oc project ${ocpproject}
+                        //         oc delete istag ${appName}:${tagName}
+                        //     """
+                        //     echo "tag deleted"
+                        // }catch(Exception e){
+                        //     echo "new tag"
+                        // }
+                        // sh """
+                        //     oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                        //     oc project ${ocpproject}
+                        //     sed -i 's,{NAMESPACE},${ocpproject},g' "$WORKSPACE/jm-act.yaml"
+                        //     sed -i 's,{CONFIGMAP_NAME},${configMapName},g' "$WORKSPACE/jm-act.yaml"
+                        //     sed -i 's,{IMAGE_DEPLOY},${jfrogurl}/${repo}/${appName}:${tagName},g' "$WORKSPACE/jm-act.yaml"
+                        //     oc apply  -n '${ocpproject}' -f $WORKSPACE/jm-act.yaml
+                        //     oc rollout status deployment/'${appName}' -n '${ocpproject}'
+                        //     oc logout
+                        //     sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                        // """
+                        // END OF V2
+
+
+                        // V1
+                        sh"""
+                            oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                            oc project ${ocpproject}
+							oc adm policy add-scc-to-user anyuid -z default
+                        """
+                        String pod = sh(script:"oc get pod", returnStdout: true).toString().trim()
+                        echo "value pod "+pod
+                        if(pod.contains("${appName}")){
+                            isNotNewApp = true
+                        }else{
+                            isNotNewApp = false
+                        }
+                        if(isNotNewApp){
+                            sh"""
+                                oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                oc project ${ocpproject}
+								oc adm policy add-scc-to-user anyuid -z default
+                                oc delete deploy ${appName}
+                                oc delete service ${appName}
+                                oc delete route ${appName}
+                            """
+                            try{
+                                sh"""
+                                    oc delete istag ${appName}:${tagName}
+                                """
+                            }catch(Exception e){
+                                echo "new tag"
+                            }
+                            sleep 30
+                            sh"""
+                                oc new-app --docker-image=${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc expose service/${appName} --port=8181-tcp
+                                oc set env deploy/${appName} --from=configmap/${configMapName}
+                                sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc logout
+                            """
+                        }else{
+                            try{
+                                sh"""
+                                    oc delete istag ${appName}:${tagName}
+                                """
+                            }catch(Exception e){
+                                echo "new tag"
+                            }
+                            sh"""
+                                oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                oc project ${ocpproject}
+								oc adm policy add-scc-to-user anyuid -z default
+                                oc new-app --docker-image=${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc expose service/${appName} --port=8181-tcp
+                                oc set env deploy/${appName} --from=configmap/${configMapName}
+                                oc annotate route ${appName} --overwrite haproxy.router.openshift.io/timeout=180s
+                                oc set resources deploy/${appName} --limits=cpu=150m,memory=600Mi --requests=cpu=100m,memory=500Mi -n '${ocpproject}'
+                                sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                                oc logout
+                            """
+
+                            try{
+                                sh"""
+                                    oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                    oc project ${ocpproject}
+                                    oc autoscale deploy/${appName} --min=1 --max=7 --cpu-percent=65 -n '${ocpproject}'
+                                """
+                            }catch(Exception e){
+                                echo "autoscale exists"
+                            }
+                        }
+                        // END OF V1
+                    }
+                    echo "success step 2"
+                }
+            }
+        }
+    }
+}

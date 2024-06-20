@@ -1,0 +1,198 @@
+/*
+ * parameter should exists : 
+ * - branch     = string default(master) 
+ * - tags       = string default(latest)
+ * - buildType  = dropdown [rebuild-and-push-to-artifactory | build-only | pull-only | deploy-only-to-ocp]
+ * - restartPod = boolean
+ *
+ */
+
+// project source code
+def projectRepo = "git@gitlab.jasamarga.co.id:romatua/payroll.git"
+def branch = env.branch
+
+//artifactory
+def url = 'http://10.1.3.177:8082/artifactory/'
+def repo = "upgrading"
+def jfrogurl = "jfrogartifactory.jasamarga.co.id"
+def tagName = env.tags
+
+// sonarqube
+def sonarUrl = "http://10.1.3.189:9000"
+
+//ocp
+def ocpurl = "https://api.ocdev.jasamarga.co.id:6443"
+def ocpproject = "upgrading"
+def appName = "payroll"
+def configMapName = "configmaps-payroll"
+def isNotNewApp = false
+
+// deployment file
+def repoDeploymentFile = "https://gitlab.jasamarga.co.id:8081/riandycandra/devops-deployment-ocp.git"
+def deploymentPath = "upgrading/dev/payroll.yaml"
+def deploymentFile = "payroll.yaml"
+
+// jenkins param
+def buildType = env.buildType
+def restartPod = env.restartPod
+
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    environment {
+        GIT_CREDENTIALS = credentials('gitlab-root')
+        DISCORD_URL = credentials('discord-webhook')
+        LAST_COMMIT_AUTHOR = ''
+        LAST_COMMIT_MESSAGE = ''
+    }
+    stages {
+        stage('Clone') {
+            steps {
+                script{
+                    cleanWs()
+                    discordSend description: "Job Started", footer: "Payroll Mediasi Apps", link: env.BUILD_URL, result: currentBuild.currentResult, title: "Payroll Mediasi Apps Build ID ${env.BUILD_ID} 💻", webhookURL: DISCORD_URL
+                    checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[credentialsId: 'gitlab-ssh-root', url: "${projectRepo}"]], branches: [[name: "${branch}"]]]
+                    def commitInfo = sh(script: 'git log -1 --pretty=format:"%H %an %s"', returnStdout: true).trim()
+
+                    // Split the commit information into parts
+                    def commitParts = commitInfo.split(' ')
+                    def lastCommitHash = commitParts[0]
+                    def lastCommitAuthor = commitParts[1]
+                    def lastCommitMessage = commitParts[2..-1].join(' ')
+
+                    LAST_COMMIT_AUTHOR = lastCommitAuthor
+                    LAST_COMMIT_MESSAGE = lastCommitMessage
+                    echo "success step 1"
+                }
+            }
+        }
+
+        stage('SonarQube Scan') {
+            steps {
+                script{
+                    echo "success step 2"
+                }
+            }
+        }
+
+        stage('preparation') {
+            steps {
+                script{
+
+                    sh"""
+                        git config --global credential.username $GIT_CREDENTIALS_USR
+                        git config --global credential.helper "!echo password=$GIT_CREDENTIALS_PSW; echo"
+
+                        git clone ${repoDeploymentFile}
+
+                        mv "${WORKSPACE}/devops-deployment-ocp/${deploymentPath}" "${WORKSPACE}"
+                        rm -rf "${WORKSPACE}/devops-deployment-ocp"
+                    """
+
+                    if(env.buildType == 'rebuild-and-push-to-artifactory' || env.buildType == 'build-only') {
+                        withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'devops-artifactory',usernameVariable: 'artifactoryUsername', passwordVariable: 'artifactoryPassword']]) { 
+                            sh"""
+                                sudo podman login -u ${artifactoryUsername} -p ${artifactoryPassword} ${jfrogurl}
+                                sudo podman build -t  ${jfrogurl}/${repo}/${appName}:${tagName} -f "${WORKSPACE}/dockerfile"
+                                sudo podman push ${jfrogurl}/${repo}/${appName}:${tagName}
+                            """
+                        }
+                    }
+                    echo "success step 3"
+                }
+            }
+        }
+        
+        stage('Deployment To OCP') {
+            steps {
+                script{
+                    if(env.buildType == 'rebuild-and-push-to-artifactory' || env.buildType == 'deploy-only-to-ocp') {
+                        withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'ocp-dev',usernameVariable: 'ocpUsername', passwordVariable: 'ocpPassword']]) { 
+                            try{
+                                sh"""
+                                    oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                    oc project ${ocpproject}
+                                    oc delete all --selector app=${appName}
+                                    oc delete service/${appName}
+                                    oc delete route/${appName}
+                                    oc delete istag ${appName}:${tagName}
+                                """
+                                echo "tag deleted"
+                            }catch(Exception e){
+                                echo "new tag"
+                            }
+                            sh """
+                                oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                oc project ${ocpproject}
+                                oc adm policy add-scc-to-user anyuid -z default
+                                sed -i 's,{NAMESPACE},${ocpproject},g' "$WORKSPACE/${deploymentFile}"
+                                sed -i 's,{CONFIGMAP_NAME},${configMapName},g' "$WORKSPACE/${deploymentFile}"
+                                sed -i 's,{IMAGE_DEPLOY},${jfrogurl}/${repo}/${appName}:${tagName},g' "$WORKSPACE/${deploymentFile}"
+                                oc apply  -n '${ocpproject}' -f $WORKSPACE/${deploymentFile}
+                                oc annotate route ${appName} --overwrite haproxy.router.openshift.io/timeout=5000s
+                                oc rollout status deployment/'${appName}' -n '${ocpproject}'
+                                oc logout
+                                sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                            """
+
+                            // V2
+                            // try {
+                            //     sh """
+                            //     oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                            //     oc project ${ocpproject}
+                            //     oc autoscale deployment/${appName} --min=5 --max=7 --cpu-percent=75
+                            //     """
+                            // }catch(Exception e){
+                            //     echo "autoscale is exist"
+                            // }
+                            // END OF V2
+
+                        }
+                    }
+
+                    if(env.restartPod == 'true') {
+                        withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'ocp-dev',usernameVariable: 'ocpUsername', passwordVariable: 'ocpPassword']]) { 
+                            try {
+                                sh """
+                                    oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                    oc project ${ocpproject}
+                                    oc rollout restart deployment/'${appName}' 
+                                """
+                            } catch(Exception e) {
+                                echo ${e}
+                            }
+                        }
+                    }
+                    echo "success step 4"
+                }
+            }
+        }
+    }
+
+    post {
+        always{
+            cleanWs()
+            script{
+                try{
+                    sh """
+                        docker builder prune -af
+                    """
+                }catch(Exception e){
+                    echo"clean workspace success"
+                }
+            }
+        }
+        success {
+            script {
+                discordSend description: "Job Run Successfully by ${LAST_COMMIT_AUTHOR} - ${LAST_COMMIT_MESSAGE}", footer: "Payroll Mediasi Apps", link: env.BUILD_URL, result: currentBuild.currentResult, title: "Payroll Mediasi Apps Build ID ${env.BUILD_ID} :camel:", webhookURL: DISCORD_URL
+            }
+        }
+        failure {
+            script {
+                discordSend description: "Job Failed by ${LAST_COMMIT_AUTHOR} - ${LAST_COMMIT_MESSAGE}", footer: "Payroll Mediasi Apps", link: env.BUILD_URL, result: currentBuild.currentResult, title: "Payroll Mediasi Apps Build ID ${env.BUILD_ID} :comet:", webhookURL: DISCORD_URL
+            }
+        }
+    }
+}

@@ -1,0 +1,24 @@
+pipeline {
+    agent {
+        label 'master'
+    }
+    
+    stages {
+        stage('Get File from Sharing Folder') {
+            steps {
+                script{
+                    echo "hello world 2"
+                }
+            }
+        }
+        stage('backup object') {
+            steps {
+                script{
+                    echo "hello world 2"
+                }
+            }
+        }
+    }
+}
+
+

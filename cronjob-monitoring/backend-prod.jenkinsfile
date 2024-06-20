@@ -1,0 +1,114 @@
+def repoDeploymentFile = "https://gitlab.jasamarga.co.id:8081/riandycandra/devops-deployment-ocp.git"
+def deploymentPath = "cronjob-monitoring/backend.yaml"
+def deploymentFile = "backend.yaml"
+
+//artifactory
+def url = 'http://10.1.3.177:8082/artifactory/'
+def repo = "cronjob-monitoring-backend"
+def jfrogurl = "jfrogartifactory.jasamarga.co.id"
+
+def appName = "cronjob-monitoring-backend"
+def tagName = env.tags
+
+def ocpurl = "https://api.ocprd.jasamarga.co.id:6443"
+def ocpproject = "aggregator-postgres-v3"
+def configMapName = "cronjob-monitoring-backend-configmap"
+
+def isNotNewApp = false
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    environment {
+        GIT_CREDENTIALS = credentials('gitlab-root')
+        DISCORD_URL = credentials('discord-webhook')
+    }
+    stages {
+        stage('preparation') {
+            steps {
+                script{
+                    cleanWs()
+                    discordSend description: "Job Started", footer: "Cronjob Monitoring Backend Production", link: env.BUILD_URL, result: currentBuild.currentResult, title: "Cronjob Monitoring Backend Build ID ${env.BUILD_ID}", webhookURL: DISCORD_URL
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'devops-artifactory',usernameVariable: 'artifactoryUsername', passwordVariable: 'artifactoryPassword']]) {
+                            sh"""
+                                git config --global credential.username $GIT_CREDENTIALS_USR
+								git config --global credential.helper "!echo password=$GIT_CREDENTIALS_PSW; echo"
+
+								git clone ${repoDeploymentFile}
+
+								mv "${WORKSPACE}/devops-deployment-ocp/${deploymentPath}" "${WORKSPACE}"
+								rm -rf "${WORKSPACE}/devops-deployment-ocp"
+                            """
+                            sh"""
+                                sudo podman login -u ${artifactoryUsername} -p ${artifactoryPassword} ${jfrogurl}
+                                sudo podman pull ${jfrogurl}/${repo}/${appName}:${tagName}
+                            """
+                    }  
+                    echo "success step 1"
+                }
+            }
+        }
+        
+        stage('Deployment To OCP') {
+            steps {
+                script{
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'ocp-prd',usernameVariable: 'ocpUsername', passwordVariable: 'ocpPassword']]) { 
+
+                        // V2
+                        try{
+                            sh"""
+                                oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                                oc project ${ocpproject}
+								oc delete all --selector app=${appName}
+								oc delete service/${appName}
+								oc delete route/${appName}
+                                oc delete istag ${appName}:${tagName}
+                            """
+                            echo "tag deleted"
+                        }catch(Exception e){
+                            echo "new tag"
+                        }
+                        sh """
+                            oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+                            oc project ${ocpproject}
+							oc adm policy add-scc-to-user anyuid -z default
+                            sed -i 's,{NAMESPACE},${ocpproject},g' "$WORKSPACE/${deploymentFile}"
+                            sed -i 's,{CONFIGMAP_NAME},${configMapName},g' "$WORKSPACE/${deploymentFile}"
+                            sed -i 's,{IMAGE_DEPLOY},${jfrogurl}/${repo}/${appName}:${tagName},g' "$WORKSPACE/${deploymentFile}"
+                            oc apply  -n '${ocpproject}' -f $WORKSPACE/${deploymentFile}
+							oc annotate route ${appName} --overwrite haproxy.router.openshift.io/timeout=5000s
+                            oc rollout status deployment/'${appName}' -n '${ocpproject}'
+                            oc logout
+                            sudo podman rmi ${jfrogurl}/${repo}/${appName}:${tagName}
+                        """
+
+						try {
+							sh """
+							oc login ${ocpurl} -u ${ocpUsername} -p ${ocpPassword}
+							oc project ${ocpproject}
+							"""
+						}catch(Exception e){
+							echo "autoscale is exist"
+						}
+                        // END OF V2
+
+                    }
+                    echo "success step 2"
+                }
+            }
+        }
+    }
+    post {
+        success {
+            script {
+                discordSend description: "Job Run Successfully", footer: "Cronjob Monitoring Backend Production", link: env.BUILD_URL, result: currentBuild.currentResult, title: "Cronjob Monitoring Backend Build ID ${env.BUILD_ID}", webhookURL: DISCORD_URL
+            }
+        }
+        failure {
+            script {
+                discordSend description: "Job Failed", footer: "Cronjob Monitoring Backend Production", link: env.BUILD_URL, result: currentBuild.currentResult, title: "Cronjob Monitoring Backend Build ID ${env.BUILD_ID}", webhookURL: DISCORD_URL
+            }
+        }
+    }
+}
